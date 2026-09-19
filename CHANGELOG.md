@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Added
+
+* `httpx.Response()` now accepts a byte iterator or async byte iterator for `content=...`, allowing streaming response content without materializing it as complete `bytes` first. Plain `bytes`/`str` content still sets `Content-Length` automatically, while iterators use `Transfer-Encoding: chunked` without fabricating a length. Sync iterators may only be consumed synchronously and async iterators only asynchronously, matching the request streaming interface.
+
 ## 0.14.3 (September 2nd, 2020)
 
 ### Added

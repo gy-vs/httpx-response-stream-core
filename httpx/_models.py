@@ -14,7 +14,7 @@ import chardet
 import rfc3986
 import rfc3986.exceptions
 
-from ._content_streams import ByteStream, ContentStream, encode
+from ._content_streams import ByteStream, ContentStream, encode, encode_response
 from ._decoders import (
     SUPPORTED_DECODERS,
     ContentDecoder,
@@ -44,6 +44,7 @@ from ._types import (
     QueryParamTypes,
     RequestData,
     RequestFiles,
+    ResponseContent,
     URLTypes,
 )
 from ._utils import (
@@ -674,7 +675,7 @@ class Response:
         http_version: str = None,
         headers: HeaderTypes = None,
         stream: ContentStream = None,
-        content: bytes = None,
+        content: ResponseContent = None,
         history: typing.List["Response"] = None,
         elapsed_func: typing.Callable = None,
     ):
@@ -691,11 +692,34 @@ class Response:
 
         self.is_closed = False
         self.is_stream_consumed = False
+
         if stream is not None:
+            # There's an important distinction between `Response(content=...)`,
+            # and `Response(stream=...)`.
+            #
+            # Using `content=...` implies automatically populated content headers,
+            # of either `Content-Length: ...` or `Transfer-Encoding: chunked`.
+            #
+            # Using `stream=...` will not automatically include any content
+            # headers. This is used when creating a response instance from
+            # a stream received from the transport API.
             self._raw_stream = stream
         else:
-            self._raw_stream = ByteStream(body=content or b"")
-            self.read()
+            self._raw_stream = encode_response(content)
+            for key, value in self._raw_stream.get_headers().items():
+                # Ignore Transfer-Encoding if the Content-Length has been set
+                # explicitly.
+                if (
+                    key.lower() == "transfer-encoding"
+                    and "content-length" in self.headers
+                ):
+                    continue
+                self.headers.setdefault(key, value)
+
+            if isinstance(content, (str, bytes)) or content is None:
+                # Load the response body for known-length content, but keep
+                # streaming content lazily consumed.
+                self.read()
 
         self._num_bytes_downloaded = 0
 
@@ -958,11 +982,15 @@ class Response:
 
         self.is_stream_consumed = True
         self._num_bytes_downloaded = 0
-        with map_exceptions(HTTPCORE_EXC_MAP, request=self._request):
-            for part in self._raw_stream:
-                self._num_bytes_downloaded += len(part)
-                yield part
-        self.close()
+        try:
+            with map_exceptions(HTTPCORE_EXC_MAP, request=self._request):
+                for part in self._raw_stream:
+                    self._num_bytes_downloaded += len(part)
+                    yield part
+        finally:
+            # Ensure the response is closed if iteration is abandoned,
+            # or if the underlying stream raises an exception partway through.
+            self.close()
 
     def next(self) -> "Response":
         """
@@ -1042,11 +1070,15 @@ class Response:
 
         self.is_stream_consumed = True
         self._num_bytes_downloaded = 0
-        with map_exceptions(HTTPCORE_EXC_MAP, request=self._request):
-            async for part in self._raw_stream:
-                self._num_bytes_downloaded += len(part)
-                yield part
-        await self.aclose()
+        try:
+            with map_exceptions(HTTPCORE_EXC_MAP, request=self._request):
+                async for part in self._raw_stream:
+                    self._num_bytes_downloaded += len(part)
+                    yield part
+        finally:
+            # Ensure the response is closed if iteration is abandoned,
+            # or if the underlying stream raises an exception partway through.
+            await self.aclose()
 
     async def anext(self) -> "Response":
         """

@@ -8,7 +8,13 @@ from urllib.parse import urlencode
 import httpcore
 
 from ._exceptions import StreamConsumed
-from ._types import FileContent, FileTypes, RequestData, RequestFiles
+from ._types import (
+    FileContent,
+    FileTypes,
+    RequestData,
+    RequestFiles,
+    ResponseContent,
+)
 from ._utils import (
     format_form_param,
     guess_content_type,
@@ -402,3 +408,27 @@ def encode(
         return IteratorStream(iterator=data)
 
     raise TypeError(f"Unexpected type for 'data', {type(data)!r}")
+
+
+def encode_response(content: ResponseContent = None) -> ContentStream:
+    """
+    Handles encoding the given `content` for a response, returning
+    a `ContentStream` implementation.
+
+    Plain `bytes` or `str` content has a known length and implies
+    a `Content-Length` header. Byte iterators and async byte iterators
+    have an unknown length, and are streamed using chunked transfer
+    encoding, without a fabricated `Content-Length`.
+    """
+    if content is None:
+        return ByteStream(body=b"")
+    elif isinstance(content, (str, bytes)):
+        return ByteStream(body=content)
+    elif hasattr(content, "__aiter__"):
+        content = typing.cast(typing.AsyncIterator[bytes], content)
+        return AsyncIteratorStream(aiterator=content)
+    elif hasattr(content, "__iter__"):
+        content = typing.cast(typing.Iterator[bytes], content)
+        return IteratorStream(iterator=content)
+
+    raise TypeError(f"Unexpected type for 'content', {type(content)!r}")

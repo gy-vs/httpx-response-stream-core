@@ -18,6 +18,55 @@ async def async_streaming_body():
     yield b"world!"
 
 
+def empty_streaming_body():
+    return
+    yield  # pragma: no cover
+
+
+async def empty_async_streaming_body():
+    return
+    yield  # pragma: no cover
+
+
+def chunked_streaming_body():
+    yield b"Hel"
+    yield b"lo, "
+    yield b"wor"
+    yield b"ld!"
+
+
+async def chunked_async_streaming_body():
+    yield b"Hel"
+    yield b"lo, "
+    yield b"wor"
+    yield b"ld!"
+
+
+class ConsumedStream:
+    """
+    An iterable that records how many times it was iterated, so we can
+    verify a streaming response is only ever consumed once.
+    """
+
+    def __init__(self):
+        self.iteration_count = 0
+
+    def __iter__(self):
+        self.iteration_count += 1
+        for chunk in (b"Hello, ", b"world!"):
+            yield chunk
+
+
+class AsyncConsumedStream:
+    def __init__(self):
+        self.iteration_count = 0
+
+    async def __aiter__(self):
+        self.iteration_count += 1
+        for chunk in (b"Hello, ", b"world!"):
+            yield chunk
+
+
 def test_response():
     response = httpx.Response(
         200,
@@ -615,3 +664,366 @@ def test_cannot_access_unset_request():
 
     with pytest.raises(RuntimeError):
         response.request
+
+
+class TestContentFromIterator:
+    def test_bytes_content_sets_content_length(self):
+        response = httpx.Response(200, content=b"Hello, world!")
+
+        assert response.headers["Content-Length"] == "13"
+        assert "Transfer-Encoding" not in response.headers
+        # Known length content is read eagerly.
+        assert response.is_closed
+        assert response.content == b"Hello, world!"
+
+    def test_empty_bytes_content_does_not_set_content_length(self):
+        response = httpx.Response(200, content=b"")
+
+        assert "Content-Length" not in response.headers
+        assert response.content == b""
+        assert response.is_closed
+
+    def test_str_content_sets_content_length(self):
+        response = httpx.Response(200, content="Hello, world!")
+
+        assert response.headers["Content-Length"] == "13"
+        assert response.content == b"Hello, world!"
+        assert response.text == "Hello, world!"
+
+    def test_iterator_content_does_not_set_content_length(self):
+        response = httpx.Response(200, content=streaming_body())
+
+        assert "Content-Length" not in response.headers
+        assert response.headers["Transfer-Encoding"] == "chunked"
+        # Streaming content is not read eagerly.
+        assert not response.is_closed
+        with pytest.raises(httpx.ResponseNotRead):
+            response.content
+
+    def test_explicit_content_length_is_not_overridden_by_chunked(self):
+        response = httpx.Response(
+            200,
+            headers={"Content-Length": "13"},
+            content=streaming_body(),
+        )
+
+        assert response.headers["Content-Length"] == "13"
+        assert "Transfer-Encoding" not in response.headers
+
+    def test_async_iterator_content_does_not_set_content_length(self):
+        response = httpx.Response(200, content=async_streaming_body())
+
+        assert "Content-Length" not in response.headers
+        assert response.headers["Transfer-Encoding"] == "chunked"
+        assert not response.is_closed
+        with pytest.raises(httpx.ResponseNotRead):
+            response.content
+
+    def test_sync_iterator_read(self):
+        response = httpx.Response(200, content=streaming_body())
+
+        assert response.read() == b"Hello, world!"
+        assert response.content == b"Hello, world!"
+        assert response.is_closed
+
+    def test_sync_iterator_iter_bytes(self):
+        response = httpx.Response(200, content=chunked_streaming_body())
+
+        chunks = list(response.iter_bytes())
+        assert b"".join(chunks) == b"Hello, world!"
+        # The chunk boundaries of the underlying stream are preserved.
+        assert [chunk for chunk in chunks if chunk] == [
+            b"Hel",
+            b"lo, ",
+            b"wor",
+            b"ld!",
+        ]
+        assert response.is_closed
+
+    def test_sync_iterator_iter_raw(self):
+        response = httpx.Response(200, content=chunked_streaming_body())
+
+        chunks = []
+        for part in response.iter_raw():
+            chunks.append(part)
+        assert chunks == [b"Hel", b"lo, ", b"wor", b"ld!"]
+        assert response.is_closed
+
+    def test_empty_sync_iterator(self):
+        response = httpx.Response(200, content=empty_streaming_body())
+
+        assert response.read() == b""
+        assert response.content == b""
+        assert response.is_closed
+
+    def test_sync_iterable_is_wrapped_and_consumed_once(self):
+        stream = ConsumedStream()
+        response = httpx.Response(200, content=stream)
+
+        assert response.read() == b"Hello, world!"
+        assert stream.iteration_count == 1
+        assert response.is_closed
+
+        # The underlying iterable is never consumed a second time.
+        with pytest.raises(httpx.StreamConsumed):
+            list(response.iter_raw())
+        assert stream.iteration_count == 1
+
+    @pytest.mark.asyncio
+    async def test_async_iterator_aread(self):
+        response = httpx.Response(200, content=async_streaming_body())
+
+        assert await response.aread() == b"Hello, world!"
+        assert response.content == b"Hello, world!"
+        assert response.is_closed
+
+    @pytest.mark.asyncio
+    async def test_async_iterator_aiter_bytes(self):
+        response = httpx.Response(200, content=chunked_async_streaming_body())
+
+        chunks = [part async for part in response.aiter_bytes()]
+        assert b"".join(chunks) == b"Hello, world!"
+        assert [chunk for chunk in chunks if chunk] == [
+            b"Hel",
+            b"lo, ",
+            b"wor",
+            b"ld!",
+        ]
+        assert response.is_closed
+
+    @pytest.mark.asyncio
+    async def test_async_iterator_aiter_raw(self):
+        response = httpx.Response(200, content=chunked_async_streaming_body())
+
+        chunks = [part async for part in response.aiter_raw()]
+        assert chunks == [b"Hel", b"lo, ", b"wor", b"ld!"]
+        assert response.is_closed
+
+    @pytest.mark.asyncio
+    async def test_empty_async_iterator(self):
+        response = httpx.Response(200, content=empty_async_streaming_body())
+
+        assert await response.aread() == b""
+        assert response.content == b""
+        assert response.is_closed
+
+    @pytest.mark.asyncio
+    async def test_async_iterable_is_consumed_once(self):
+        stream = AsyncConsumedStream()
+        response = httpx.Response(200, content=stream)
+
+        assert await response.aread() == b"Hello, world!"
+        assert stream.iteration_count == 1
+
+        with pytest.raises(httpx.StreamConsumed):
+            [part async for part in response.aiter_raw()]
+        assert stream.iteration_count == 1
+
+    def test_repeated_sync_read_returns_cached_content(self):
+        response = httpx.Response(200, content=streaming_body())
+
+        first = response.read()
+        second = response.read()
+        assert first == second == b"Hello, world!"
+
+    @pytest.mark.asyncio
+    async def test_repeated_async_aread_returns_cached_content(self):
+        response = httpx.Response(200, content=async_streaming_body())
+
+        first = await response.aread()
+        second = await response.aread()
+        assert first == second == b"Hello, world!"
+
+    def test_cannot_sync_read_after_sync_streaming_consumed(self):
+        response = httpx.Response(200, content=streaming_body())
+
+        assert b"".join(response.iter_bytes()) == b"Hello, world!"
+
+        with pytest.raises(httpx.StreamConsumed):
+            response.read()
+
+    @pytest.mark.asyncio
+    async def test_cannot_async_aread_after_async_streaming_consumed(self):
+        response = httpx.Response(200, content=async_streaming_body())
+
+        chunks = [part async for part in response.aiter_bytes()]
+        assert b"".join(chunks) == b"Hello, world!"
+
+        with pytest.raises(httpx.StreamConsumed):
+            await response.aread()
+
+    def test_cannot_sync_consume_async_iterator(self):
+        response = httpx.Response(200, content=async_streaming_body())
+
+        with pytest.raises(RuntimeError):
+            response.read()
+
+    def test_cannot_sync_iter_raw_on_async_iterator(self):
+        response = httpx.Response(200, content=async_streaming_body())
+
+        with pytest.raises(RuntimeError):
+            list(response.iter_raw())
+
+    @pytest.mark.asyncio
+    async def test_cannot_async_consume_sync_iterator(self):
+        response = httpx.Response(200, content=streaming_body())
+
+        with pytest.raises(RuntimeError):
+            await response.aread()
+
+    @pytest.mark.asyncio
+    async def test_cannot_async_aiter_raw_on_sync_iterator(self):
+        response = httpx.Response(200, content=streaming_body())
+
+        with pytest.raises(RuntimeError):
+            [part async for part in response.aiter_raw()]
+
+    def test_sync_iterator_close_before_read(self):
+        is_closed = False
+
+        def close_func():
+            nonlocal is_closed
+            is_closed = True
+
+        stream = IteratorStream(iterator=streaming_body(), close_func=close_func)
+        response = httpx.Response(200, stream=stream)
+
+        response.close()
+        assert is_closed
+
+        with pytest.raises(httpx.ResponseClosed):
+            response.read()
+        with pytest.raises(httpx.ResponseClosed):
+            list(response.iter_raw())
+
+    @pytest.mark.asyncio
+    async def test_async_iterator_aclose_before_aread(self):
+        is_closed = False
+
+        async def close_func():
+            nonlocal is_closed
+            is_closed = True
+
+        stream = AsyncIteratorStream(
+            aiterator=async_streaming_body(), close_func=close_func
+        )
+        response = httpx.Response(200, stream=stream)
+
+        await response.aclose()
+        assert is_closed
+
+        with pytest.raises(httpx.ResponseClosed):
+            await response.aread()
+        with pytest.raises(httpx.ResponseClosed):
+            [part async for part in response.aiter_raw()]
+
+    def test_abandoning_sync_iterator_closes_response(self):
+        is_closed = False
+
+        def close_func():
+            nonlocal is_closed
+            is_closed = True
+
+        stream = IteratorStream(iterator=streaming_body(), close_func=close_func)
+        response = httpx.Response(200, stream=stream)
+
+        iterator = response.iter_raw()
+        assert next(iterator) == b"Hello, "
+        assert not is_closed
+
+        # Abandoning iteration partway through still closes the response.
+        del iterator
+        assert is_closed
+        assert response.is_closed
+        assert response.is_stream_consumed
+
+    @pytest.mark.asyncio
+    async def test_abandoning_async_iterator_closes_response(self):
+        is_closed = False
+
+        async def close_func():
+            nonlocal is_closed
+            is_closed = True
+
+        stream = AsyncIteratorStream(
+            aiterator=async_streaming_body(), close_func=close_func
+        )
+        response = httpx.Response(200, stream=stream)
+
+        aiterator = response.aiter_raw().__aiter__()
+        assert await aiterator.__anext__() == b"Hello, "
+        assert not is_closed
+
+        await aiterator.aclose()
+        assert is_closed
+        assert response.is_closed
+        assert response.is_stream_consumed
+
+    def test_sync_generator_exception_propagates(self):
+        def failing_body():
+            yield b"Hello, "
+            raise ValueError("boom")
+
+        response = httpx.Response(200, content=failing_body())
+
+        with pytest.raises(ValueError, match="boom"):
+            response.read()
+
+        # The response is left in a consistent closed/consumed state.
+        assert response.is_closed
+        assert response.is_stream_consumed
+        with pytest.raises(httpx.StreamConsumed):
+            list(response.iter_raw())
+
+    def test_sync_generator_exception_partway_through_iter(self):
+        def failing_body():
+            yield b"Hello, "
+            raise ValueError("boom")
+
+        response = httpx.Response(200, content=failing_body())
+
+        chunks = []
+        with pytest.raises(ValueError, match="boom"):
+            for part in response.iter_raw():
+                chunks.append(part)
+
+        assert chunks == [b"Hello, "]
+        assert response.is_closed
+        assert response.is_stream_consumed
+
+    @pytest.mark.asyncio
+    async def test_async_generator_exception_propagates(self):
+        async def failing_body():
+            yield b"Hello, "
+            raise ValueError("boom")
+
+        response = httpx.Response(200, content=failing_body())
+
+        with pytest.raises(ValueError, match="boom"):
+            await response.aread()
+
+        assert response.is_closed
+        assert response.is_stream_consumed
+        with pytest.raises(httpx.StreamConsumed):
+            [part async for part in response.aiter_raw()]
+
+    @pytest.mark.asyncio
+    async def test_async_generator_exception_partway_through_iter(self):
+        async def failing_body():
+            yield b"Hello, "
+            raise ValueError("boom")
+
+        response = httpx.Response(200, content=failing_body())
+
+        chunks = []
+        with pytest.raises(ValueError, match="boom"):
+            async for part in response.aiter_raw():
+                chunks.append(part)
+
+        assert chunks == [b"Hello, "]
+        assert response.is_closed
+        assert response.is_stream_consumed
+
+    def test_invalid_content_type_raises_type_error(self):
+        with pytest.raises(TypeError):
+            httpx.Response(200, content=123)  # type: ignore
